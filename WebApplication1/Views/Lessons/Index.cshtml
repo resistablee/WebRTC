@@ -1,0 +1,26 @@
+﻿@model List<Lesson>
+@{
+    ViewData["Title"] = "Index";
+}
+
+<h1>Dersler</h1>
+
+<table class="table">
+    <thead>
+        <tr>
+            <th>Ders</th>
+            <th>Derse Git</th>
+        </tr>
+    </thead>
+    <tbody>
+        @foreach (var lesson in Model)
+        {
+            <tr>
+                <td>@lesson.Name</td>
+                <td>
+                    <a asp-action="Class" asp-controller="Lessons" asp-route-Id="@lesson.Id" class="btn btn-success">Go to lesson</a>
+                </td>
+            </tr>
+        }
+    </tbody>
+</table>

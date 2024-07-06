@@ -1,0 +1,329 @@
+﻿@model Lesson
+@{
+    ViewData["Title"] = "ClassRoom";
+}
+
+<h2>@Model.Name</h2>
+<p>Lesson ID: @Model.Id</p>
+
+<div class="container-fluid">
+    <div class="row">
+        <div class="col-8">
+            <div id="lesson-container" class="container-fluid">
+                <div id="videoContainer" class="container-fluid row">
+                    <div id="video-container" class="row row-cols-4 justify-content-lg-start">
+                        <div class="col">
+                            <video id="localVideo" autoplay playsinline muted></video>
+                        </div>
+                    </div>
+                </div>
+                <div id="controls" class="row">
+                    <div class="col-1">
+                        <button id="toggleCameraButton">Kamerayı Aç/Kapa</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div class="col-4">
+            <div class="container bootstrap snippets bootdeys">
+                <div class="col-xs-12 col-md-offset-2">
+                    <!-- Panel Chat -->
+                    <div class="panel" id="chat">
+                        <div class="panel-heading">
+                            <h3 class="panel-title">
+                                <i class="icon wb-chat-text" aria-hidden="true"></i> Chat
+                            </h3>
+                        </div>
+                        <div class="panel-body">
+                            <div class="chats" id="messages" style="height: 500px; overflow-y: scroll;">
+                                <!-- Mesajlar buraya eklenecek -->
+                            </div>
+                        </div>
+                        <div class="panel-footer">
+                            <form id="messageForm">
+                                <div class="input-group">
+                                    <input type="text" class="form-control" id="messageInput" placeholder="Say something">
+                                    <span class="input-group-btn">
+                                        <button class="btn btn-primary" id="sendButton" type="button">Send</button>
+                                    </span>
+                                </div>
+                            </form>
+                        </div>
+                    </div>
+                    <!-- End Panel Chat -->
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+
+<script>
+    const connection = new signalR.HubConnectionBuilder()
+        .withUrl("/lessonHub")
+        .build();
+
+    const lessonId = window.location.pathname.split("/").pop();
+
+    const iceServers = {
+        iceServers: [
+            { urls: 'stun:stun.l.google.com:19302' },
+            { urls: 'stun:stun1.l.google.com:19302' },
+        ]
+    };
+
+    let localStream;
+    let isCameraOn = false; // Kameranın default olarak kapalı olduğunu belirtiyoruz
+    const peers = {};
+    const remoteStreams = {};
+    const constraints = {
+        video: true, // Default olarak kameranın kapalı olmasını istiyorsak false olarak ayarlayabiliriz.
+        audio: true
+    };
+
+    // SignalR bağlantısının sunucudan "UserJoined" adlı bir mesaj aldığında çalıştıracağı olay
+    connection.on("UserJoined", async (connectionId) => {
+        console.log(`${connectionId} joined the lesson.`);
+
+        // if (!peers[connectionId]) {
+        if (connectionId !== connection.connectionId) {
+            await createRemoteVideoElement(connectionId);
+            await addPeerConnection(connectionId);
+        }
+    });
+
+    // SignalR bağlantısının sunucudan "UserLeft" adlı bir mesaj aldığında çalıştıracağı olay
+    connection.on("UserLeft", async (connectionId) => {
+        console.log(`${connectionId} left the lesson.`);
+        removeRemoteVideoElement(connectionId);
+        removePeerConnection(connectionId);
+    });
+
+    // SignalR bağlantısının sunucudan "ExistingUsers" adlı bir mesaj aldığında çalıştıracağı olay
+    connection.on("ExistingUsers", async (users) => {
+        for (const userId of users) {
+            // if (!peers[userId]) {
+            if (userId !== connection.connectionId) {
+                await createRemoteVideoElement(userId);
+                await addPeerConnection(userId);
+            }
+        }
+    });
+
+    // SignalR bağlantısının sunucudan "ReceiveOffer" adlı bir mesaj aldığında çalıştıracağı olay
+    connection.on("ReceiveOffer", async (senderId, sdp) => {
+        const peerConnection = peers[senderId];
+        if (peerConnection) {
+            console.log(`ReceiveOffer from ${senderId}`);
+            await peerConnection.setRemoteDescription(new RTCSessionDescription({ type: 'offer', sdp }));
+            const answer = await peerConnection.createAnswer();
+            await peerConnection.setLocalDescription(answer);
+            connection.invoke("SendAnswer", lessonId, connection.connectionId, senderId, answer.sdp);
+        }
+    });
+
+    // SignalR bağlantısının sunucudan "ReceiveAnswer" adlı bir mesaj aldığında çalıştıracağı olay
+    connection.on("ReceiveAnswer", async (senderId, sdp) => {
+        const peerConnection = peers[senderId];
+        if (peerConnection) {
+            console.log(`ReceiveAnswer from ${senderId}`);
+            await peerConnection.setRemoteDescription(new RTCSessionDescription({ type: 'answer', sdp }));
+        }
+    });
+
+    // SignalR bağlantısının sunucudan "ReceiveCandidate" adlı bir mesaj aldığında çalıştıracağı olay
+    connection.on("ReceiveCandidate", async (senderId, candidate) => {
+        const peerConnection = peers[senderId];
+        if (peerConnection) {
+            console.log(`ReceiveCandidate from ${senderId}`);
+            await peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
+        }
+    });
+
+    // SignalR bağlantısının başlatılmasını sağlar
+    async function startConnection() {
+        try {
+            await startLocalStream();
+            await connection.start();
+            console.log("SignalR Connected.");
+            await connection.invoke("UserJoinedToLesson", lessonId);
+        } catch (err) {
+            console.error(err);
+            setTimeout(startConnection, 5000);
+        }
+    }
+
+    // Kullanıcının yerel video akışını başlatır
+    async function startLocalStream() {
+        try {
+            localStream = await navigator.mediaDevices.getUserMedia(constraints);
+            const localVideo = document.getElementById("localVideo");
+            localVideo.srcObject = localStream;
+        } catch (err) {
+            console.error('Error accessing media devices.', err);
+        }
+    }
+
+    // Yeni bir peer connection oluşturur ve sunucuya bağlantı bilgilerini gönderir
+    async function addPeerConnection(connectionId) {
+        const peerConnection = new RTCPeerConnection(iceServers);
+        peers[connectionId] = peerConnection;
+
+        console.log("Peers count:", Object.keys(peers).length);
+
+        localStream.getTracks().forEach(track => {
+            console.log(`Adding local track ${track.kind} to peer connection with ${connectionId}`);
+            peerConnection.addTrack(track, localStream);
+        });
+
+        peerConnection.onicecandidate = ({ candidate }) => {
+            if (candidate) {
+                connection.invoke("SendCandidate", lessonId, connection.connectionId, connectionId, candidate.candidate)
+                    .catch(err => console.error("Error sending candidate: ", err));
+            }
+        };
+
+        try {
+            peerConnection.ontrack = ({ streams }) => {
+
+                console.log(`Track event received for connectionId: ${connectionId}`);
+                streams.forEach(stream => {
+
+                    if (!remoteStreams[connectionId]) {
+                        remoteStreams[connectionId] = new MediaStream();
+                    }
+                    remoteStreams[connectionId].addTrack(stream.getTracks()[0]);
+
+                    const videoElement = document.getElementById(`remoteVideo-${connectionId}`);
+                    if (videoElement) {
+                        videoElement.srcObject = localStream;
+                    }
+                });
+
+                console.log("RemoteStreams count:", Object.keys(remoteStreams).length);
+            };
+
+            peerConnection.onconnectionstatechange = () => {
+                console.log(`Peer connection state for ${connectionId}: ${peerConnection.connectionState}`);
+            };
+        } catch (err) {
+            console.error("Error adding peer connection event handlers:", err);
+        }
+
+        try {
+            const offer = await peerConnection.createOffer();
+            await peerConnection.setLocalDescription(offer);
+            connection.invoke("SendOffer", lessonId, connection.connectionId, connectionId, offer.sdp);
+        } catch (err) {
+            console.error("Error creating or setting local description:", err);
+        }
+    }
+
+    // Yeni bir video elementi oluşturur ve belirtilen kullanıcının video akışını bu elemente bağlar
+    async function createRemoteVideoElement(connectionId) {
+        if (connectionId === connection.connectionId) {
+            return;
+        }
+
+        const videoContainer = document.createElement('div');
+        videoContainer.className = 'remote-video-container col';
+        const videoElement = document.createElement('video');
+        videoElement.id = `remoteVideo-${connectionId}`;
+        videoElement.autoplay = true;
+        videoElement.playsInline = true;
+        videoContainer.appendChild(videoElement);
+        document.getElementById('video-container').appendChild(videoContainer);
+
+        // if (remoteStreams[connectionId]) {
+        //     videoElement.srcObject = remoteStreams[connectionId];
+        // }
+    }
+
+    // Bir peer connection'ı kaldırır ve ilgili video akışını durdurur
+    function removePeerConnection(connectionId) {
+        if (peers[connectionId]) {
+            peers[connectionId].close();
+            delete peers[connectionId];
+        }
+        if (remoteStreams[connectionId]) {
+            remoteStreams[connectionId].getTracks().forEach(track => track.stop());
+            delete remoteStreams[connectionId];
+        }
+    }
+
+    // Bir kullanıcı çıktığında diğer kullanıcılardan video akışının kaldırılmasını sağlar
+    function removeRemoteVideoElement(connectionId) {
+        const videoElement = document.getElementById(`remoteVideo-${connectionId}`);
+        if (videoElement) {
+            const videoContainer = videoElement.parentElement;
+            if (videoContainer) {
+                videoContainer.remove();
+            }
+        }
+    }
+
+    startConnection();
+
+    // Chating
+    // SignalR bağlantısının sunucudan "ReceiveMessage" adlı bir mesaj aldığında çalıştıracağı olay
+    connection.on("ReceiveMessage", (connectionId, user, message, timestamp) => {
+        addMessageToChat(connectionId, user, message, new Date(timestamp));
+    });
+
+    // SignalR bağlantısının sunucudan "LoadMessages" adlı bir mesaj aldığında çalıştıracağı olay
+    connection.on("LoadMessages", (messages) => {
+        messages.forEach(msg => {
+            addMessageToChat(null, msg.user, msg.content, new Date(msg.timestamp));
+        });
+    });
+
+    document.getElementById("toggleCameraButton").addEventListener("click", async () => {
+        const videoTrack = localStream.getVideoTracks()[0];
+        if (videoTrack) {
+            isCameraOn = !videoTrack.enabled;
+            videoTrack.enabled = !videoTrack.enabled;
+        }
+    });
+
+    document.getElementById("sendButton").addEventListener("click", async () => {
+        const messageInput = document.getElementById("messageInput");
+        const message = messageInput.value;
+        await connection.invoke("SendMessage", lessonId, 'username-1', message);
+        messageInput.value = '';
+    });
+
+    document.getElementById("messageInput").addEventListener("keypress", async (e) => {
+        if (e.key === "Enter") {
+            e.preventDefault();
+            document.getElementById("sendButton").click();
+        }
+    });
+
+    function addMessageToChat(connectionId, user, message, timestamp) {
+        const messagesDiv = document.getElementById("messages");
+        const messageElement = document.createElement("div");
+        messageElement.className = connectionId === connection?.connectionId && user != 'System' ? 'chat' : 'chat chat-left';
+
+        const avatarDiv = document.createElement("div");
+        avatarDiv.className = "chat-avatar";
+        const avatarLink = document.createElement("a");
+        avatarLink.className = "avatar avatar-online";
+        const avatarImg = document.createElement("img");
+        avatarImg.src = connectionId === connection?.connectionId ? 'https://bootdey.com/img/Content/avatar/avatar2.png' : 'https://bootdey.com/img/Content/avatar/avatar1.png';
+        avatarLink.appendChild(avatarImg);
+        avatarDiv.appendChild(avatarLink);
+
+        const chatBodyDiv = document.createElement("div");
+        chatBodyDiv.className = "chat-body";
+        const chatContentDiv = document.createElement("div");
+        chatContentDiv.className = "chat-content";
+        chatContentDiv.innerHTML = `<p><strong>${user}:</strong> ${message}</p><time class="chat-time" datetime="${timestamp.toISOString()}">${timestamp.toLocaleTimeString()}</time>`;
+        chatBodyDiv.appendChild(chatContentDiv);
+
+        messageElement.appendChild(avatarDiv);
+        messageElement.appendChild(chatBodyDiv);
+        messagesDiv.appendChild(messageElement);
+        messagesDiv.scrollTop = messagesDiv.scrollHeight;
+    }
+</script>
+@* // selman rümeysaya aşık <3 <3 *@
